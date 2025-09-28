@@ -1,0 +1,143 @@
+# mtf_slanted_edge.py
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import windows
+from scipy.interpolate import interp1d
+from scipy.fft import fft, fftfreq
+
+# -------- SETTINGS --------
+IMAGE_PATH = "edge.jpg"   # change to your file
+# Crop region where slanted edge is (x, y, width, height)
+ROI = (400, 200, 800, 800)  # adjust to your image
+UPSAMPLE = 4   # oversampling factor (subpixel sampling)
+WINDOW = 'hann'  # window for LSF before FFT
+PLOT = True
+CSV_OUT = "mtf_output.csv"
+# --------------------------
+
+def load_gray(path):
+    im = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if im is None:
+        raise FileNotFoundError(path)
+    if im.ndim == 3:
+        im = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+    im = im.astype(np.float64)
+    # normalize if 8-bit / 16-bit
+    if im.max() > 1.1:
+        im /= im.max()
+    return im
+
+def crop(img, roi):
+    x,y,w,h = roi
+    return img[y:y+h, x:x+w]
+
+def estimate_edge_angle(im):
+    # use Canny + Hough to estimate dominant line angle
+    edges = (cv2.Canny((im*255).astype(np.uint8), 50, 150))
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50, minLineLength=30, maxLineGap=10)
+    if lines is None:
+        # fallback: Sobel gradient + PCA of strong gradient points
+        gx = cv2.Sobel(im, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(im, cv2.CV_64F, 0, 1, ksize=3)
+        mag = np.hypot(gx, gy)
+        pts = np.column_stack(np.nonzero(mag > np.percentile(mag, 95)))
+        if len(pts) < 2:
+            return 0.0
+        # PCA
+        pts_centered = pts - pts.mean(axis=0)
+        U, S, Vt = np.linalg.svd(pts_centered, full_matrices=False)
+        direction = Vt[0]
+        angle = np.arctan2(direction[0], direction[1])  # note swap
+        return np.degrees(angle)
+    # average angles
+    angles = []
+    for l in lines[:,0]:
+        x1,y1,x2,y2 = l
+        angle = np.arctan2((y2-y1), (x2-x1))
+        angles.append(angle)
+    mean_angle = np.mean(angles)
+    return np.degrees(mean_angle)
+
+def rotate_image(img, angle_deg):
+    (h,w) = img.shape[:2]
+    center = (w/2, h/2)
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    rotated = cv2.warpAffine(img, M, (w,h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
+def compute_esf(im, upsample=4):
+    # upsample image to get subpixel sampling
+    H, W = im.shape
+    im_up = cv2.resize(im, (W*upsample, H*upsample), interpolation=cv2.INTER_CUBIC)
+    # assume edge vertical: average rows to get ESF across columns
+    esf = im_up.mean(axis=0)  # average along height -> function across x
+    return esf, upsample
+
+def compute_lsf_from_esf(esf):
+    # differentiate ESF to get LSF
+    lsf = np.gradient(esf)
+    # center lsf (zero mean baseline)
+    lsf -= lsf.mean()
+    return lsf
+
+def mtf_from_lsf(lsf, pixel_pitch=1.0):
+    # apply window to reduce ringing
+    w = windows.hann(len(lsf))
+    lsf_w = lsf * w
+    # FFT
+    N = len(lsf_w)
+    F = np.abs(fft(lsf_w))
+    F = F[:N//2]
+    freqs = fftfreq(N, d=pixel_pitch)[:N//2]
+    # normalize: MTF(0) = 1
+    mtf = F / F.max()
+    return freqs, mtf
+
+def find_mtf50(freqs, mtf):
+    # linear interpolate for where mtf crosses 0.5
+    if mtf[0] < 0.5:
+        return None
+    try:
+        f_interp = interp1d(mtf, freqs, bounds_error=False)
+        return float(f_interp(0.5))
+    except Exception:
+        return None
+
+def main():
+    im = load_gray(IMAGE_PATH)
+    roi = crop(im, ROI)
+    angle = estimate_edge_angle((roi*255).astype(np.uint8))
+    print(f"Estimated edge angle (deg): {angle:.2f}")
+    # rotate so edge is vertical -> rotate by -angle
+    roi_rot = rotate_image(roi, -angle)
+    esf, up = compute_esf(roi_rot, upsample=UPSAMPLE)
+    lsf = compute_lsf_from_esf(esf)
+    freqs, mtf = mtf_from_lsf(lsf, pixel_pitch=1.0/upsample)  # freq in cycles/pixel
+    # convert cycles/pixel to cycles/mm or cycles/degree if you know sensor pix/mm etc.
+    mtf50 = find_mtf50(freqs, mtf)
+    print(f"MTF50 (cycles/pixel): {mtf50:.4f}")
+
+    if PLOT:
+        plt.figure(figsize=(8,5))
+        plt.plot(freqs, mtf, label='MTF')
+        if mtf50 is not None:
+            plt.axvline(mtf50, color='gray', linestyle='--', label=f"MTF50={mtf50:.3f} c/p")
+        plt.xlabel('Spatial frequency (cycles/pixel)')
+        plt.ylabel('MTF (normalized)')
+        plt.title('MTF (slanted edge)')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+    # save table
+    import csv
+    with open(CSV_OUT, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["frequency_cycles_per_pixel", "mtf"])
+        for fr, m in zip(freqs, mtf):
+            writer.writerow([fr, m])
+    print(f"Saved MTF data to {CSV_OUT}")
+
+if __name__ == "__main__":
+    main()
